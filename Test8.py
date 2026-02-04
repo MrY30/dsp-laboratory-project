@@ -7,133 +7,145 @@ from scipy import signal
 from collections import deque
 
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QLabel, QPushButton, QComboBox, QProgressBar, QStackedWidget
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel,
+    QPushButton, QComboBox, QProgressBar, QStackedWidget
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 import pyqtgraph as pg
 
-# ==========================
-# DSP CONFIGURATION
-# ==========================
+# =====================
+# CONFIGURATION
+# =====================
 CHUNK = 1024
 RATE = 44100
 GAIN = 5.0
 
-# Feature smoothing window
 SMOOTH_WIN = 7
-DECISION_HOLD = 0.15  # seconds
+DECISION_HOLD = 0.12
+UI_REFRESH_MS = 33
 
-# ==========================
-# GAME CONTROLS
-# ==========================
 KEY_ACCEL = 'w'
 KEY_BRAKE = 's'
 KEY_LEFT = 'a'
 KEY_RIGHT = 'd'
 KEY_RESPAWN = 'q'
 
-# ==========================
-# AUDIO WORKER
-# ==========================
+# =====================
+# AUDIO THREAD
+# =====================
 class AudioWorker(QThread):
-    update_gui = pyqtSignal(dict)
-    error = pyqtSignal(str)
+    update_data = pyqtSignal(dict)
+    calib_progress = pyqtSignal(int)
+    calib_done = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
         self.running = True
+        self.mode = 'IDLE'
         self.device = None
 
         self.p = pyaudio.PyAudio()
         self.stream = None
 
-        # DSP filters
         self.hp = signal.butter(8, 100, 'hp', fs=RATE, output='sos')
 
-        # Feature buffers
-        self.hist = {
-            'vol': deque(maxlen=SMOOTH_WIN),
-            'pitch': deque(maxlen=SMOOTH_WIN),
-            'low': deque(maxlen=SMOOTH_WIN),
-            'mid': deque(maxlen=SMOOTH_WIN),
-            'high': deque(maxlen=SMOOTH_WIN)
-        }
+        self.hist = {k: deque(maxlen=SMOOTH_WIN)
+                     for k in ['vol','pitch','low','mid','high']}
 
-        # Thresholds
+        self.calib_buf = []
+        self.calib_target = 60
+        self.calib_step = 0
+
         self.thresh = {
-            'silence': 600,
+            'silence': 500,
             'pitch': 0,
             'ratio_oe': 1.5,
             'ratio_ssh': 3.0,
             'clap': 15000
         }
 
-        self.last_action = None
+        self.last_action = 'IDLE'
         self.last_time = 0
 
-        self.pressed = {
-            KEY_ACCEL: False,
-            KEY_BRAKE: False,
-            KEY_LEFT: False,
-            KEY_RIGHT: False
-        }
+        self.pressed = {KEY_ACCEL:False, KEY_BRAKE:False,
+                        KEY_LEFT:False, KEY_RIGHT:False}
 
     def set_device(self, idx):
         self.device = idx
 
+    def start_calibration(self, step):
+        self.calib_step = step
+        self.calib_buf.clear()
+        self.mode = 'CALIB'
+
     def run(self):
-        try:
-            self.stream = self.p.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=RATE,
-                input=True,
-                input_device_index=self.device,
-                frames_per_buffer=CHUNK
-            )
-        except Exception as e:
-            self.error.emit(str(e))
-            return
+        self.stream = self.p.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=RATE,
+            input=True,
+            input_device_index=self.device,
+            frames_per_buffer=CHUNK
+        )
 
         while self.running:
             data = self.stream.read(CHUNK, exception_on_overflow=False)
             audio = np.frombuffer(data, dtype=np.int16).astype(np.float64) * GAIN
             audio = signal.sosfilt(self.hp, audio)
 
-            vol = np.sqrt(np.mean(audio ** 2))
+            vol = np.sqrt(np.mean(audio**2))
             fft = np.abs(np.fft.rfft(audio * np.hamming(len(audio))))
 
             def band(lo, hi):
-                return np.sum(fft[int(lo / (RATE / CHUNK)):int(hi / (RATE / CHUNK))])
+                return np.sum(fft[int(lo/(RATE/CHUNK)):int(hi/(RATE/CHUNK))])
 
-            feats = {
+            m = {
                 'vol': vol,
-                'pitch': band(100, 300),
-                'low': band(300, 800),
-                'mid': band(2000, 4000),
-                'high': band(5000, 10000)
+                'pitch': band(100,300),
+                'low': band(300,800),
+                'mid': band(2000,4000),
+                'high': band(5000,10000),
+                'raw': audio,
+                'fft': fft
             }
 
-            for k in feats:
-                self.hist[k].append(feats[k])
+            if self.mode == 'CALIB':
+                self.calib_buf.append(m)
+                self.calib_progress.emit(
+                    int(100 * len(self.calib_buf) / self.calib_target)
+                )
+                if len(self.calib_buf) >= self.calib_target:
+                    self.finish_calibration()
+                continue
+
+            for k in self.hist:
+                self.hist[k].append(m[k])
 
             sm = {k: np.median(self.hist[k]) for k in self.hist}
-
             action = self.decide(sm)
-            self.apply(action)
+            self.apply_keys(action)
 
-            self.update_gui.emit({
-                'action': action,
-                'vol': sm['vol'],
-                'pitch': sm['pitch']
-            })
+            m['action'] = action
+            self.update_data.emit(m)
 
         self.cleanup()
 
-    # ==========================
-    # DECISION LOGIC (STABLE)
-    # ==========================
+    def finish_calibration(self):
+        vols = [x['vol'] for x in self.calib_buf]
+        pitch = np.median([x['pitch'] for x in self.calib_buf])
+        r_oe = np.median([x['mid']/(x['low']+1) for x in self.calib_buf])
+        r_ssh = np.median([x['high']/(x['mid']+1) for x in self.calib_buf])
+
+        self.mode = 'IDLE'
+        self.calib_done.emit({
+            'step': self.calib_step,
+            'vol': np.mean(vols),
+            'max_vol': np.max(vols),
+            'pitch': pitch,
+            'r_oe': r_oe,
+            'r_ssh': r_ssh
+        })
+
     def decide(self, m):
         now = time.time()
         if now - self.last_time < DECISION_HOLD:
@@ -145,103 +157,43 @@ class AudioWorker(QThread):
             return 'RESPAWN'
 
         if m['vol'] < self.thresh['silence']:
-            self.last_action = 'IDLE'
             return 'IDLE'
 
         if m['pitch'] > self.thresh['pitch']:
-            ratio = m['mid'] / (m['low'] + 1)
-            act = 'LEFT' if ratio > self.thresh['ratio_oe'] else 'RIGHT'
+            act = 'LEFT' if m['mid']/(m['low']+1) > self.thresh['ratio_oe'] else 'RIGHT'
         else:
-            ratio = m['high'] / (m['mid'] + 1)
-            act = 'GAS' if ratio > self.thresh['ratio_ssh'] else 'BRAKE'
+            act = 'GAS' if m['high']/(m['mid']+1) > self.thresh['ratio_ssh'] else 'BRAKE'
 
         self.last_action = act
         self.last_time = now
         return act
 
-    # ==========================
-    # KEY HANDLING
-    # ==========================
-    def apply(self, act):
+    def apply_keys(self, act):
         mapping = {
-            'LEFT': (True, False, True, False),
-            'RIGHT': (True, False, False, True),
-            'GAS': (True, False, False, False),
-            'BRAKE': (False, True, False, False),
-            'IDLE': (False, False, False, False)
+            'LEFT': (True,False,True,False),
+            'RIGHT': (True,False,False,True),
+            'GAS': (True,False,False,False),
+            'BRAKE': (False,True,False,False),
+            'IDLE': (False,False,False,False)
         }
 
         if act == 'RESPAWN':
             pydirectinput.press(KEY_RESPAWN)
             return
 
-        up, down, left, right = mapping.get(act, (False, False, False, False))
-        keys = [(KEY_ACCEL, up), (KEY_BRAKE, down),
-                (KEY_LEFT, left), (KEY_RIGHT, right)]
-
-        for k, s in keys:
+        up, down, left, right = mapping.get(act,(0,0,0,0))
+        for k, s in zip([KEY_ACCEL,KEY_BRAKE,KEY_LEFT,KEY_RIGHT],
+                        [up,down,left,right]):
             if s and not self.pressed[k]:
                 pydirectinput.keyDown(k)
-                self.pressed[k] = True
+                self.pressed[k]=True
             elif not s and self.pressed[k]:
                 pydirectinput.keyUp(k)
-                self.pressed[k] = False
+                self.pressed[k]=False
 
     def cleanup(self):
         for k in self.pressed:
             if self.pressed[k]:
                 pydirectinput.keyUp(k)
-        self.stream.stop_stream()
         self.stream.close()
         self.p.terminate()
-
-# ==========================
-# GUI
-# ==========================
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("DSP Voice Controller – Improved")
-        self.resize(500, 400)
-
-        self.worker = AudioWorker()
-        self.worker.update_gui.connect(self.update_status)
-
-        layout = QVBoxLayout()
-        self.lbl = QLabel("IDLE")
-        self.lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl.setStyleSheet("font-size: 28px; padding: 20px;")
-        layout.addWidget(self.lbl)
-
-        btn = QPushButton("START")
-        btn.clicked.connect(self.start)
-        layout.addWidget(btn)
-
-        w = QWidget()
-        w.setLayout(layout)
-        self.setCentralWidget(w)
-
-    def start(self):
-        p = pyaudio.PyAudio()
-        for i in range(p.get_device_count()):
-            if p.get_device_info_by_index(i)['maxInputChannels'] > 0:
-                self.worker.set_device(i)
-                break
-        p.terminate()
-        self.worker.start()
-
-    def update_status(self, d):
-        self.lbl.setText(d['action'])
-
-    def closeEvent(self, e):
-        self.worker.running = False
-        e.accept()
-
-# ==========================
-# MAIN
-# ==========================
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
